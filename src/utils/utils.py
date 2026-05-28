@@ -132,7 +132,9 @@ def compute_normalized_laplacian(adj):
 
 
 def build_sim(context):
-    context_norm = context.div(torch.norm(context, p=2, dim=-1, keepdim=True))
+    norms = torch.norm(context, p=2, dim=-1, keepdim=True)
+    norms = torch.where(norms == 0.0, torch.ones_like(norms), norms)
+    context_norm = context.div(norms)
     sim = torch.mm(context_norm, context_norm.transpose(1, 0))
     return sim
 
