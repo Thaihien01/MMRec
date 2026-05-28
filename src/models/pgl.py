@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common.abstract_recommender import GeneralRecommender
-from sparsesvd import sparsesvd
 
 
 class PGL(GeneralRecommender):
@@ -137,6 +136,7 @@ class PGL(GeneralRecommender):
 
     def global_subgraph_extraction(self, adj):
         norm_adj = adj.tocsc()
+        from sparsesvd import sparsesvd  # only needed in global mode
         ut, s, vt = sparsesvd(norm_adj, self.embedding_dim)
 
         # Get the top and bottom 25% of singular values
