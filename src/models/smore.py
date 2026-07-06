@@ -34,6 +34,10 @@ class SMORE(GeneralRecommender):
         self.text_knn_k = config['text_knn_k']
         self.dropout_rate = config['dropout_rate']
         self.dropout = nn.Dropout(p=self.dropout_rate)
+        
+        self.temperature = config['temperature'] if 'temperature' in config else 0.2
+        self.cl_align_weight = config['cl_align_weight'] if 'cl_align_weight' in config else 0.0
+        self.edge_dropout = config['edge_dropout'] if 'edge_dropout' in config else 0.0
 
         self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
 
@@ -121,9 +125,15 @@ class SMORE(GeneralRecommender):
             nn.Sigmoid()
         )
 
-        self.image_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
-        self.text_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
-        self.fusion_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
+        stdv = 1. / math.sqrt(self.embedding_dim)
+        self.image_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32) * stdv)
+        self.text_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32) * stdv)
+        self.fusion_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32) * stdv)
+        
+        self.image_ln = nn.LayerNorm(self.embedding_dim)
+        self.text_ln = nn.LayerNorm(self.embedding_dim)
+        self.fusion_ln = nn.LayerNorm(self.embedding_dim)
+        self.beta_weight = nn.Parameter(torch.tensor(0.1))
         
 
     def pre_epoch_processing(self):
@@ -205,14 +215,44 @@ class SMORE(GeneralRecommender):
         
         return image_conv, text_conv, fusion_conv
     
+    def sparse_dropout(self, x, keep_prob):
+        if not self.training or keep_prob >= 1.0 or keep_prob <= 0.0:
+            return x
+        x = x.coalesce()
+        rc = x.indices()
+        val = x.values()
+        noise_shape = val.shape[0]
+        mask = (torch.rand(noise_shape, device=val.device) + keep_prob).floor().type(torch.bool)
+        val = val[mask] / keep_prob
+        rc = rc[:, mask]
+        return torch.sparse.FloatTensor(rc, val, x.shape).coalesce().to(x.device)
+
     def forward(self, adj, train=False):
         if self.v_feat is not None:
             image_feats = self.image_trs(self.image_embedding.weight)
         if self.t_feat is not None:
             text_feats = self.text_trs(self.text_embedding.weight)
 
+        if train and self.edge_dropout > 0:
+            adj = self.sparse_dropout(adj, 1.0 - self.edge_dropout)
+            R_adj = self.sparse_dropout(self.R, 1.0 - self.edge_dropout)
+            if self.v_feat is not None:
+                image_original_adj = self.sparse_dropout(self.image_original_adj, 1.0 - self.edge_dropout)
+            if self.t_feat is not None:
+                text_original_adj = self.sparse_dropout(self.text_original_adj, 1.0 - self.edge_dropout)
+            fusion_adj = self.sparse_dropout(self.fusion_adj, 1.0 - self.edge_dropout)
+        else:
+            R_adj = self.R
+            image_original_adj = self.image_original_adj if self.v_feat is not None else None
+            text_original_adj = self.text_original_adj if self.t_feat is not None else None
+            fusion_adj = self.fusion_adj
+
         #   Spectrum Modality Fusion
         image_conv, text_conv, fusion_conv = self.spectrum_convolution(image_feats, text_feats)
+        image_conv = self.image_ln(image_conv)
+        text_conv = self.text_ln(text_conv)
+        fusion_conv = self.fusion_ln(fusion_conv)
+
         image_item_embeds = torch.multiply(self.item_id_embedding.weight, self.gate_v(image_conv))
         text_item_embeds = torch.multiply(self.item_id_embedding.weight, self.gate_t(text_conv))
         fusion_item_embeds = torch.multiply(self.item_id_embedding.weight, self.gate_f(fusion_conv))
@@ -233,33 +273,45 @@ class SMORE(GeneralRecommender):
 
         #   Item-Item Modality Specific and Fusion views
         #   Image-view
+        image_embeds_list = [image_item_embeds]
         if self.sparse:
             for i in range(self.n_layers):
-                image_item_embeds = torch.sparse.mm(self.image_original_adj, image_item_embeds)
+                image_item_embeds = torch.sparse.mm(image_original_adj, image_item_embeds)
+                image_embeds_list.append(image_item_embeds)
         else:
             for i in range(self.n_layers):
-                image_item_embeds = torch.mm(self.image_original_adj, image_item_embeds)
-        image_user_embeds = torch.sparse.mm(self.R, image_item_embeds)
+                image_item_embeds = torch.mm(image_original_adj.to_dense(), image_item_embeds)
+                image_embeds_list.append(image_item_embeds)
+        image_item_embeds = torch.stack(image_embeds_list, dim=1).mean(dim=1)
+        image_user_embeds = torch.sparse.mm(R_adj, image_item_embeds)
         image_embeds = torch.cat([image_user_embeds, image_item_embeds], dim=0)
 
         #   Text-view
+        text_embeds_list = [text_item_embeds]
         if self.sparse:
             for i in range(self.n_layers):
-                text_item_embeds = torch.sparse.mm(self.text_original_adj, text_item_embeds)
+                text_item_embeds = torch.sparse.mm(text_original_adj, text_item_embeds)
+                text_embeds_list.append(text_item_embeds)
         else:
             for i in range(self.n_layers):
-                text_item_embeds = torch.mm(self.text_original_adj, text_item_embeds)
-        text_user_embeds = torch.sparse.mm(self.R, text_item_embeds)
+                text_item_embeds = torch.mm(text_original_adj.to_dense(), text_item_embeds)
+                text_embeds_list.append(text_item_embeds)
+        text_item_embeds = torch.stack(text_embeds_list, dim=1).mean(dim=1)
+        text_user_embeds = torch.sparse.mm(R_adj, text_item_embeds)
         text_embeds = torch.cat([text_user_embeds, text_item_embeds], dim=0)
 
         #   Fusion-view
+        fusion_embeds_list = [fusion_item_embeds]
         if self.sparse:
             for i in range(self.n_layers):
-                fusion_item_embeds = torch.sparse.mm(self.fusion_adj, fusion_item_embeds)
+                fusion_item_embeds = torch.sparse.mm(fusion_adj, fusion_item_embeds)
+                fusion_embeds_list.append(fusion_item_embeds)
         else:
             for i in range(self.n_layers):
-                fusion_item_embeds = torch.mm(self.fusion_adj, fusion_item_embeds)
-        fusion_user_embeds = torch.sparse.mm(self.R, fusion_item_embeds)
+                fusion_item_embeds = torch.mm(fusion_adj.to_dense(), fusion_item_embeds)
+                fusion_embeds_list.append(fusion_item_embeds)
+        fusion_item_embeds = torch.stack(fusion_embeds_list, dim=1).mean(dim=1)
+        fusion_user_embeds = torch.sparse.mm(R_adj, fusion_item_embeds)
         fusion_embeds = torch.cat([fusion_user_embeds, fusion_item_embeds], dim=0)
 
         #   Modality-aware Preference Module
@@ -281,12 +333,12 @@ class SMORE(GeneralRecommender):
 
         side_embeds = torch.mean(torch.stack([agg_image_embeds, agg_text_embeds, fusion_embeds]), dim=0) 
 
-        all_embeds = content_embeds + side_embeds
+        all_embeds = content_embeds + torch.sigmoid(self.beta_weight) * side_embeds
 
         all_embeddings_users, all_embeddings_items = torch.split(all_embeds, [self.n_users, self.n_items], dim=0)
 
         if train:
-            return all_embeddings_users, all_embeddings_items, side_embeds, content_embeds
+            return all_embeddings_users, all_embeddings_items, side_embeds, content_embeds, image_item_embeds, text_item_embeds
 
         return all_embeddings_users, all_embeddings_items
 
@@ -318,7 +370,7 @@ class SMORE(GeneralRecommender):
         pos_items = interaction[1]
         neg_items = interaction[2]
 
-        ua_embeddings, ia_embeddings, side_embeds, content_embeds = self.forward(
+        ua_embeddings, ia_embeddings, side_embeds, content_embeds, image_item_embeds, text_item_embeds = self.forward(
             self.norm_adj, train=True)
 
         u_g_embeddings = ua_embeddings[users]
@@ -330,8 +382,12 @@ class SMORE(GeneralRecommender):
 
         side_embeds_users, side_embeds_items = torch.split(side_embeds, [self.n_users, self.n_items], dim=0)
         content_embeds_user, content_embeds_items = torch.split(content_embeds, [self.n_users, self.n_items], dim=0)
-        cl_loss = self.InfoNCE(side_embeds_items[pos_items], content_embeds_items[pos_items], 0.2) + self.InfoNCE(
-            side_embeds_users[users], content_embeds_user[users], 0.2)
+        cl_loss = self.InfoNCE(side_embeds_items[pos_items], content_embeds_items[pos_items], self.temperature) + \
+                  self.InfoNCE(side_embeds_users[users], content_embeds_user[users], self.temperature)
+
+        if self.cl_align_weight > 0:
+            align_loss = self.InfoNCE(image_item_embeds[pos_items], text_item_embeds[pos_items], self.temperature)
+            return batch_mf_loss + batch_emb_loss + batch_reg_loss + self.cl_loss * cl_loss + self.cl_align_weight * align_loss
 
         return batch_mf_loss + batch_emb_loss + batch_reg_loss + self.cl_loss * cl_loss
 
