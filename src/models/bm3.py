@@ -31,6 +31,13 @@ class BM3(GeneralRecommender):
         self.cl_weight = config['cl_weight']
         self.dropout = config['dropout']
 
+        # config flags for improvements
+        self.gated_fusion = config['gated_fusion'] if 'gated_fusion' in config else True
+        self.multimodal_gcn = config['multimodal_gcn'] if 'multimodal_gcn' in config else True
+        self.mlp_predictor = config['mlp_predictor'] if 'mlp_predictor' in config else True
+        self.separate_predictors = config['separate_predictors'] if 'separate_predictors' in config else True
+        self.mlp_features = config['mlp_features'] if 'mlp_features' in config else True
+
         self.n_nodes = self.n_users + self.n_items
 
         # load dataset info
@@ -41,19 +48,78 @@ class BM3(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
-        self.predictor = nn.Linear(self.embedding_dim, self.embedding_dim)
+        self.cf_predictor = self.build_predictor(self.embedding_dim, self.mlp_predictor)
+        self.cf_predictor.apply(self._init_weights)
+
         self.reg_loss = EmbLoss()
 
-        nn.init.xavier_normal_(self.predictor.weight)
+        if self.separate_predictors:
+            if self.t_feat is not None:
+                self.text_predictor = self.build_predictor(self.embedding_dim, self.mlp_predictor)
+                self.text_predictor.apply(self._init_weights)
+            if self.v_feat is not None:
+                self.image_predictor = self.build_predictor(self.embedding_dim, self.mlp_predictor)
+                self.image_predictor.apply(self._init_weights)
+        else:
+            self.text_predictor = self.cf_predictor
+            self.image_predictor = self.cf_predictor
+
+        if self.gated_fusion:
+            if self.v_feat is not None:
+                self.v_gate = nn.Sequential(
+                    nn.Linear(self.embedding_dim * 2, self.embedding_dim),
+                    nn.Sigmoid()
+                )
+                self.v_gate.apply(self._init_weights)
+            if self.t_feat is not None:
+                self.t_gate = nn.Sequential(
+                    nn.Linear(self.embedding_dim * 2, self.embedding_dim),
+                    nn.Sigmoid()
+                )
+                self.t_gate.apply(self._init_weights)
 
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_normal_(self.image_trs.weight)
+            if self.mlp_features:
+                self.image_trs = nn.Sequential(
+                    nn.Linear(self.v_feat.shape[1], self.feat_embed_dim * 2),
+                    nn.LayerNorm(self.feat_embed_dim * 2),
+                    nn.GELU(),
+                    nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim)
+                )
+            else:
+                self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            self.image_trs.apply(self._init_weights)
+
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
-            nn.init.xavier_normal_(self.text_trs.weight)
+            if self.mlp_features:
+                self.text_trs = nn.Sequential(
+                    nn.Linear(self.t_feat.shape[1], self.feat_embed_dim * 2),
+                    nn.LayerNorm(self.feat_embed_dim * 2),
+                    nn.GELU(),
+                    nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim)
+                )
+            else:
+                self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            self.text_trs.apply(self._init_weights)
+
+    def build_predictor(self, dim, use_mlp):
+        if use_mlp:
+            return nn.Sequential(
+                nn.Linear(dim, dim * 2),
+                nn.LayerNorm(dim * 2),
+                nn.GELU(),
+                nn.Linear(dim * 2, dim)
+            )
+        else:
+            return nn.Linear(dim, dim)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
 
     def get_norm_adj_mat(self, interaction_matrix):
         A = sp.dok_matrix((self.n_users + self.n_items,
@@ -64,7 +130,7 @@ class BM3(GeneralRecommender):
                              [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col),
                                   [1] * inter_M_t.nnz)))
-        A._update(data_dict)
+        A.update(data_dict)
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
         # add epsilon to avoid Devide by zero Warning
@@ -84,7 +150,26 @@ class BM3(GeneralRecommender):
     def forward(self):
         h = self.item_id_embedding.weight
 
-        ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
+        if self.multimodal_gcn:
+            item_feats = h
+            if self.t_feat is not None:
+                t_feat = self.text_trs(self.text_embedding.weight)
+                if self.gated_fusion:
+                    t_gate_val = self.t_gate(torch.cat([h, t_feat], dim=-1))
+                    item_feats = item_feats + t_gate_val * t_feat
+                else:
+                    item_feats = item_feats + t_feat
+            if self.v_feat is not None:
+                v_feat = self.image_trs(self.image_embedding.weight)
+                if self.gated_fusion:
+                    v_gate_val = self.v_gate(torch.cat([h, v_feat], dim=-1))
+                    item_feats = item_feats + v_gate_val * v_feat
+                else:
+                    item_feats = item_feats + v_feat
+            ego_embeddings = torch.cat((self.user_embedding.weight, item_feats), dim=0)
+        else:
+            ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
+
         all_embeddings = [ego_embeddings]
         for i in range(self.n_layers):
             ego_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
@@ -118,7 +203,7 @@ class BM3(GeneralRecommender):
                 v_feat_target = v_feat_online.clone()
                 v_feat_target = F.dropout(v_feat_target, self.dropout)
 
-        u_online, i_online = self.predictor(u_online_ori), self.predictor(i_online_ori)
+        u_online, i_online = self.cf_predictor(u_online_ori), self.cf_predictor(i_online_ori)
 
         users, items = interactions[0], interactions[1]
         u_online = u_online[users, :]
@@ -128,13 +213,13 @@ class BM3(GeneralRecommender):
 
         loss_t, loss_v, loss_tv, loss_vt = 0.0, 0.0, 0.0, 0.0
         if self.t_feat is not None:
-            t_feat_online = self.predictor(t_feat_online)
+            t_feat_online = self.text_predictor(t_feat_online)
             t_feat_online = t_feat_online[items, :]
             t_feat_target = t_feat_target[items, :]
             loss_t = 1 - cosine_similarity(t_feat_online, i_target.detach(), dim=-1).mean()
             loss_tv = 1 - cosine_similarity(t_feat_online, t_feat_target.detach(), dim=-1).mean()
         if self.v_feat is not None:
-            v_feat_online = self.predictor(v_feat_online)
+            v_feat_online = self.image_predictor(v_feat_online)
             v_feat_online = v_feat_online[items, :]
             v_feat_target = v_feat_target[items, :]
             loss_v = 1 - cosine_similarity(v_feat_online, i_target.detach(), dim=-1).mean()
@@ -149,7 +234,7 @@ class BM3(GeneralRecommender):
     def full_sort_predict(self, interaction):
         user = interaction[0]
         u_online, i_online = self.forward()
-        u_online, i_online = self.predictor(u_online), self.predictor(i_online)
+        u_online, i_online = self.cf_predictor(u_online), self.cf_predictor(i_online)
         score_mat_ui = torch.matmul(u_online[user], i_online.transpose(0, 1))
         return score_mat_ui
 

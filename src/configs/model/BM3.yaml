@@ -8,6 +8,12 @@ cl_weight: 2.0
 
 use_neg_sampling: False
 
+gated_fusion: True
+multimodal_gcn: True
+mlp_predictor: True
+separate_predictors: True
+mlp_features: True
+
 hyper_parameters: ["n_layers", "reg_weight", "dropout"]
 
 epochs: 200
