@@ -36,6 +36,12 @@ class FREEDOM(GeneralRecommender):
         self.dropout = config['dropout']
         self.degree_ratio = config['degree_ratio']
 
+        # New configurations
+        self.reg_weight_l2 = config['reg_weight_l2'] if 'reg_weight_l2' in config else 0.0
+        self.mm_edge_dropout = config['mm_edge_dropout'] if 'mm_edge_dropout' in config else 0.0
+        self.mlp_features = config['mlp_features'] if 'mlp_features' in config else True
+        self.gated_fusion = config['gated_fusion'] if 'gated_fusion' in config else True
+
         self.n_nodes = self.n_users + self.n_items
 
         # load dataset info
@@ -51,15 +57,43 @@ class FREEDOM(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
+        self.reg_loss = EmbLoss()
+
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_freedomdsp_{}_{}.pt'.format(self.knn_k, int(10*self.mm_image_weight)))
 
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            if self.mlp_features:
+                self.image_trs = nn.Sequential(
+                    nn.Linear(self.v_feat.shape[1], self.feat_embed_dim * 2),
+                    nn.LayerNorm(self.feat_embed_dim * 2),
+                    nn.GELU(),
+                    nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim)
+                )
+            else:
+                self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+            self.image_trs.apply(self._init_weights)
+
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            if self.mlp_features:
+                self.text_trs = nn.Sequential(
+                    nn.Linear(self.t_feat.shape[1], self.feat_embed_dim * 2),
+                    nn.LayerNorm(self.feat_embed_dim * 2),
+                    nn.GELU(),
+                    nn.Linear(self.feat_embed_dim * 2, self.feat_embed_dim)
+                )
+            else:
+                self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+            self.text_trs.apply(self._init_weights)
+
+        if self.gated_fusion:
+            self.combine_gate = nn.Sequential(
+                nn.Linear(self.embedding_dim * 2, self.embedding_dim),
+                nn.Sigmoid()
+            )
+            self.combine_gate.apply(self._init_weights)
 
         if os.path.exists(mm_adj_file):
             self.mm_adj = torch.load(mm_adj_file)
@@ -75,6 +109,24 @@ class FREEDOM(GeneralRecommender):
                 del text_adj
                 del image_adj
             torch.save(self.mm_adj, mm_adj_file)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+
+    def sparse_dropout(self, x, keep_prob):
+        if not self.training or keep_prob >= 1.0 or keep_prob <= 0.0:
+            return x
+        x = x.coalesce()
+        rc = x.indices()
+        val = x.values()
+        noise_shape = val.shape[0]
+        mask = (torch.rand(noise_shape, device=val.device) + keep_prob).floor().type(torch.bool)
+        val = val[mask] / keep_prob
+        rc = rc[:, mask]
+        return torch.sparse.FloatTensor(rc, val, x.shape).coalesce().to(x.device)
 
     def get_knn_adj_mat(self, mm_embeddings):
         context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
@@ -100,15 +152,17 @@ class FREEDOM(GeneralRecommender):
         return torch.sparse.FloatTensor(indices, values, adj_size)
 
     def get_norm_adj_mat(self):
-        A = sp.dok_matrix((self.n_users + self.n_items,
-                           self.n_users + self.n_items), dtype=np.float32)
         inter_M = self.interaction_matrix
         inter_M_t = self.interaction_matrix.transpose()
-        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users),
-                             [1] * inter_M.nnz))
-        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col),
-                                  [1] * inter_M_t.nnz)))
-        A._update(data_dict)
+
+        # Combine user-item and item-user interactions into a single COO matrix
+        row = np.concatenate([inter_M.row, inter_M_t.row + self.n_users])
+        col = np.concatenate([inter_M.col + self.n_users, inter_M_t.col])
+        data = np.ones_like(row, dtype=np.float32)
+
+        A = sp.coo_matrix((data, (row, col)),
+                           shape=(self.n_users + self.n_items, self.n_users + self.n_items))
+
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
         # add epsilon to avoid Devide by zero Warning
@@ -163,8 +217,12 @@ class FREEDOM(GeneralRecommender):
 
     def forward(self, adj):
         h = self.item_id_embedding.weight
+        mm_adj = self.mm_adj
+        if self.training and self.mm_edge_dropout > 0:
+            mm_adj = self.sparse_dropout(mm_adj, 1.0 - self.mm_edge_dropout)
+
         for i in range(self.n_layers):
-            h = torch.sparse.mm(self.mm_adj, h)
+            h = torch.sparse.mm(mm_adj, h)
 
         ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
         all_embeddings = [ego_embeddings]
@@ -175,7 +233,14 @@ class FREEDOM(GeneralRecommender):
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
-        return u_g_embeddings, i_g_embeddings + h
+        
+        if self.gated_fusion:
+            gate = self.combine_gate(torch.cat([i_g_embeddings, h], dim=-1))
+            fused_i_embeddings = i_g_embeddings + gate * h
+        else:
+            fused_i_embeddings = i_g_embeddings + h
+
+        return u_g_embeddings, fused_i_embeddings
 
     def bpr_loss(self, users, pos_items, neg_items):
         pos_scores = torch.sum(torch.mul(users, pos_items), dim=1)
@@ -207,7 +272,16 @@ class FREEDOM(GeneralRecommender):
         if self.v_feat is not None:
             image_feats = self.image_trs(self.image_embedding.weight)
             mf_v_loss = self.bpr_loss(ua_embeddings[users], image_feats[pos_items], image_feats[neg_items])
-        return batch_mf_loss + self.reg_weight * (mf_t_loss + mf_v_loss)
+
+        # L2 Regularization Loss
+        reg_loss = 0.0
+        if self.reg_weight_l2 > 0:
+            u_ego = self.user_embedding(users)
+            pos_i_ego = self.item_id_embedding(pos_items)
+            neg_i_ego = self.item_id_embedding(neg_items)
+            reg_loss = self.reg_loss(u_ego, pos_i_ego, neg_i_ego)
+
+        return batch_mf_loss + self.reg_weight * (mf_t_loss + mf_v_loss) + self.reg_weight_l2 * reg_loss
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
