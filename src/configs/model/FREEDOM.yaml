@@ -18,6 +18,6 @@ mm_edge_dropout: 0.1
 mlp_features: True
 gated_fusion: True
 
-hyper_parameters: []
+hyper_parameters: ["n_ui_layers", "reg_weight", "reg_weight_l2", "dropout", "mm_edge_dropout"]
 
 epochs: 600
