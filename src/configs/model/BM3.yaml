@@ -16,4 +16,4 @@ mlp_features: True
 
 hyper_parameters: ["n_layers", "reg_weight", "dropout"]
 
-epochs: 200
+epochs: 600

@@ -15,4 +15,4 @@ dropout: 0.3
 
 hyper_parameters: []
 
-epochs: 200
+epochs: 600
