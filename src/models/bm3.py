@@ -122,15 +122,17 @@ class BM3(GeneralRecommender):
                 nn.init.constant_(m.bias, 0.0)
 
     def get_norm_adj_mat(self, interaction_matrix):
-        A = sp.dok_matrix((self.n_users + self.n_items,
-                           self.n_users + self.n_items), dtype=np.float32)
         inter_M = interaction_matrix
         inter_M_t = interaction_matrix.transpose()
-        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users),
-                             [1] * inter_M.nnz))
-        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col),
-                                  [1] * inter_M_t.nnz)))
-        A.update(data_dict)
+
+        # Combine user-item and item-user interactions into a single COO matrix
+        row = np.concatenate([inter_M.row, inter_M_t.row + self.n_users])
+        col = np.concatenate([inter_M.col + self.n_users, inter_M_t.col])
+        data = np.ones_like(row, dtype=np.float32)
+
+        A = sp.coo_matrix((data, (row, col)),
+                           shape=(self.n_users + self.n_items, self.n_users + self.n_items))
+
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
         # add epsilon to avoid Devide by zero Warning
