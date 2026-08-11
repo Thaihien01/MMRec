@@ -37,6 +37,8 @@ class BM3(GeneralRecommender):
         self.mlp_predictor = config['mlp_predictor'] if 'mlp_predictor' in config else True
         self.separate_predictors = config['separate_predictors'] if 'separate_predictors' in config else True
         self.mlp_features = config['mlp_features'] if 'mlp_features' in config else True
+        self.predictor_in_eval = config['predictor_in_eval'] if 'predictor_in_eval' in config else True
+        self.eval_normalize = config['eval_normalize'] if 'eval_normalize' in config else True
 
         self.n_nodes = self.n_users + self.n_items
 
@@ -208,35 +210,51 @@ class BM3(GeneralRecommender):
         u_online, i_online = self.cf_predictor(u_online_ori), self.cf_predictor(i_online_ori)
 
         users, items = interactions[0], interactions[1]
-        u_online = u_online[users, :]
-        i_online = i_online[items, :]
-        u_target = u_target[users, :]
-        i_target = i_target[items, :]
+        u_online_b = u_online[users, :]
+        i_online_b = i_online[items, :]
+        u_target_b = u_target[users, :]
+        i_target_b = i_target[items, :]
 
         loss_t, loss_v, loss_tv, loss_vt = 0.0, 0.0, 0.0, 0.0
         if self.t_feat is not None:
             t_feat_online = self.text_predictor(t_feat_online)
-            t_feat_online = t_feat_online[items, :]
-            t_feat_target = t_feat_target[items, :]
-            loss_t = 1 - cosine_similarity(t_feat_online, i_target.detach(), dim=-1).mean()
-            loss_tv = 1 - cosine_similarity(t_feat_online, t_feat_target.detach(), dim=-1).mean()
+            t_feat_online_b = t_feat_online[items, :]
+            t_feat_target_b = t_feat_target[items, :]
+            loss_t = 1 - cosine_similarity(t_feat_online_b, i_target_b.detach(), dim=-1).mean()
+            loss_tv = 1 - cosine_similarity(t_feat_online_b, t_feat_target_b.detach(), dim=-1).mean()
         if self.v_feat is not None:
             v_feat_online = self.image_predictor(v_feat_online)
-            v_feat_online = v_feat_online[items, :]
-            v_feat_target = v_feat_target[items, :]
-            loss_v = 1 - cosine_similarity(v_feat_online, i_target.detach(), dim=-1).mean()
-            loss_vt = 1 - cosine_similarity(v_feat_online, v_feat_target.detach(), dim=-1).mean()
+            v_feat_online_b = v_feat_online[items, :]
+            v_feat_target_b = v_feat_target[items, :]
+            loss_v = 1 - cosine_similarity(v_feat_online_b, i_target_b.detach(), dim=-1).mean()
+            loss_vt = 1 - cosine_similarity(v_feat_online_b, v_feat_target_b.detach(), dim=-1).mean()
 
-        loss_ui = 1 - cosine_similarity(u_online, i_target.detach(), dim=-1).mean()
-        loss_iu = 1 - cosine_similarity(i_online, u_target.detach(), dim=-1).mean()
+        loss_ui = 1 - cosine_similarity(u_online_b, i_target_b.detach(), dim=-1).mean()
+        loss_iu = 1 - cosine_similarity(i_online_b, u_target_b.detach(), dim=-1).mean()
 
-        return (loss_ui + loss_iu).mean() + self.reg_weight * self.reg_loss(u_online_ori, i_online_ori) + \
+        reg_loss = self.reg_loss(u_online_ori[users], i_online_ori[items])
+
+        return (loss_ui + loss_iu).mean() + self.reg_weight * reg_loss + \
                self.cl_weight * (loss_t + loss_v + loss_tv + loss_vt).mean()
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
-        u_online, i_online = self.forward()
-        u_online, i_online = self.cf_predictor(u_online), self.cf_predictor(i_online)
-        score_mat_ui = torch.matmul(u_online[user], i_online.transpose(0, 1))
+        u_online_ori, i_online_ori = self.forward()
+        if self.predictor_in_eval:
+            u_online = self.cf_predictor(u_online_ori)
+            i_online = i_online_ori
+        else:
+            u_online = u_online_ori
+            i_online = i_online_ori
+
+        if self.eval_normalize:
+            u_embed = F.normalize(u_online[user], dim=-1)
+            i_embed = F.normalize(i_online, dim=-1)
+        else:
+            u_embed = u_online[user]
+            i_embed = i_online
+
+        score_mat_ui = torch.matmul(u_embed, i_embed.transpose(0, 1))
         return score_mat_ui
+
 

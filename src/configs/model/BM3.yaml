@@ -1,10 +1,13 @@
 embedding_size: 64
 feat_embed_dim: 64
 
-n_layers: [2]
-dropout: [0.3]
-reg_weight: [0.01]
-cl_weight: 2.0
+n_layers: [2, 3]
+dropout: [0.2, 0.3]
+reg_weight: [0.001, 0.01]
+cl_weight: [0.05, 0.1, 0.2]
+
+predictor_in_eval: True
+eval_normalize: True
 
 use_neg_sampling: False
 
@@ -14,6 +17,6 @@ mlp_predictor: True
 separate_predictors: True
 mlp_features: True
 
-hyper_parameters: ["n_layers", "reg_weight", "dropout"]
+hyper_parameters: ["n_layers", "cl_weight", "reg_weight", "dropout"]
 
-epochs: 600
+epochs: 600
