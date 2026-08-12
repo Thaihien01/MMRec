@@ -114,9 +114,17 @@ class FREEDOM(GeneralRecommender):
             )
             self.combine_gate.apply(self._init_weights)
 
+        # Move feature embeddings to model device before constructing kNN graph
+        if self.v_feat is not None:
+            self.image_embedding = self.image_embedding.to(self.device)
+            self.image_trs = self.image_trs.to(self.device)
+        if self.t_feat is not None:
+            self.text_embedding = self.text_embedding.to(self.device)
+            self.text_trs = self.text_trs.to(self.device)
+
         # Construct or load item kNN graph using projected feature embeddings
         if os.path.exists(mm_adj_file) and not self.rebuild_mm_adj:
-            self.mm_adj = torch.load(mm_adj_file)
+            self.mm_adj = torch.load(mm_adj_file, map_location=self.device)
         else:
             if self.v_feat is not None:
                 v_proj = self.image_trs(self.image_embedding.weight).detach()
@@ -131,6 +139,8 @@ class FREEDOM(GeneralRecommender):
                 del text_adj
                 del image_adj
             torch.save(self.mm_adj, mm_adj_file)
+
+        self.mm_adj = self.mm_adj.to(self.device)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -156,20 +166,20 @@ class FREEDOM(GeneralRecommender):
         _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
         adj_size = sim.size()
         del sim
-        indices0 = torch.arange(knn_ind.shape[0]).to(self.device)
+        indices0 = torch.arange(knn_ind.shape[0], device=mm_embeddings.device)
         indices0 = torch.unsqueeze(indices0, 1)
         indices0 = indices0.expand(-1, self.knn_k)
         indices = torch.stack((torch.flatten(indices0), torch.flatten(knn_ind)), 0)
         return indices, self.compute_normalized_laplacian(indices, adj_size)
 
     def compute_normalized_laplacian(self, indices, adj_size):
-        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
+        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size).to(indices.device)
         row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
         r_inv_sqrt = torch.pow(row_sum, -0.5)
         rows_inv_sqrt = r_inv_sqrt[indices[0]]
         cols_inv_sqrt = r_inv_sqrt[indices[1]]
         values = rows_inv_sqrt * cols_inv_sqrt
-        return torch.sparse.FloatTensor(indices, values, adj_size)
+        return torch.sparse.FloatTensor(indices, values, adj_size).to(indices.device)
 
     def get_norm_adj_mat(self):
         inter_M = self.interaction_matrix
@@ -229,6 +239,12 @@ class FREEDOM(GeneralRecommender):
     def forward(self, adj):
         h = self.item_id_embedding.weight
         mm_adj = self.mm_adj
+        if mm_adj.device != h.device:
+            mm_adj = mm_adj.to(h.device)
+            self.mm_adj = mm_adj
+        if adj.device != h.device:
+            adj = adj.to(h.device)
+
         if self.training and self.mm_edge_dropout > 0:
             mm_adj = self.sparse_dropout(mm_adj, 1.0 - self.mm_edge_dropout)
 
